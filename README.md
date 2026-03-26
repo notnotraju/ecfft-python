@@ -72,6 +72,34 @@ f(x) = u(ψ(x)) + x^{n/2} · v(ψ(x))
 
 where u holds the low coefficients and v the high. See `_enter_impl` and `_exit_impl` in the source.
 
+## FRI-like folding
+
+The library includes FRI-style folding operations for building proof systems over non-FFT-friendly fields:
+
+```python
+from ecfft_algorithms import build_fftree, ecfft_decompose_step, ecfft_fold_step, ecfft_fold
+from ecfft_params_2_20 import params
+
+tree, _ = build_fftree(params, log_n=5)  # domain of size 32
+
+# Evaluate a polynomial
+coeffs = list(range(1, 33))
+evals = tree.enter(coeffs)
+
+# Decompose: f(x) = u(ψ(x)) + x^{n/2} · v(ψ(x))
+# Returns evaluations of u, v on the half-size image domain
+u_evals, v_evals = ecfft_decompose_step(evals, tree)
+
+# FRI fold with a random challenge α
+alpha = 42
+folded = ecfft_fold_step(evals, tree, alpha)  # evals of u + α·v (size 16)
+
+# Multi-round fold
+folded = ecfft_fold(evals, tree, [42, 99, 7])  # 3 rounds: 32 → 16 → 8 → 4
+```
+
+Note: unlike the classic FFT where folding is a pointwise 2×2 solve, the ECFFT decomposition uses the FFTree's modular reduction machinery internally. See the §11 comments in `ecfft_algorithms.py` for details.
+
 ## Requirements
 
 Python 3.8+. No dependencies.

@@ -43,6 +43,35 @@ half of the domain (moiety S₀), it computes the evaluations on the other half
 strategy.
 
 
+Pointwise folding  (FRI-like decomposition)
+---------------------------------------------
+
+The key operation for FRI-like protocols: given f(x) = u(ψ(x)) + x^{n/2} · v(ψ(x))
+evaluated on an n-point domain, decompose into evaluations of u and v on the
+half-size ψ-image domain, then combine with a random challenge α::
+
+    f_folded(y) = u(y) + α · v(y)      (degree < n/2, on n/2 points)
+
+Unlike the classic FFT where folding is a pointwise 2×2 solve (because
+f(ω^i) and f(−ω^i) share the same u, v values), the ECFFT decomposition
+requires the FFTree's **modular reduction** machinery.  The reason is that
+the ECFFT's ENTER recombines u and v via the extend operation, which is a
+non-local algebraic operation — not a simple per-pair formula.
+
+The correct decomposition (one level of EXIT) is::
+
+    u_on_S0  = modular_reduce(⟨f ≀ S⟩,  ⟨x^{n/2} ≀ S⟩,  ⟨Z₀² mod x^{n/2} ≀ S⟩)[S₀]
+    v_on_S0  = (f(S₀) − u(S₀)) / S₀^{n/2}
+
+Available as:
+
+  * ``ecfft_decompose_step(evals, tree)`` → (u_evals, v_evals) on the subtree domain
+  * ``ecfft_fold_step(evals, tree, alpha)`` → evaluations of u + α·v
+  * ``ecfft_fold(evals, tree, [α₁, α₂, …])`` → multi-round folding
+
+See §11 at the bottom of this file.
+
+
 §1  Field Arithmetic
 ---------------------
 """
@@ -946,6 +975,172 @@ def verify_two_to_one(psi, domain_xs):
     for img, pre in sorted(images.items()):
         assert len(pre) == 2, f"Expected 2 preimages for {img}, got {len(pre)}"
     return [img for img in sorted(images.keys())]
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# §11  Pointwise folding — FRI-like decomposition
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# This section provides the "local" folding operation that underpins
+# FRI-like protocols over non-FFT-friendly fields.
+#
+# Recall the ECFFT decomposition for a polynomial f of degree < n:
+#
+#     f(x) = u(ψ(x)) + x^{n/2} · v(ψ(x))
+#
+# where  u  has the low-half coefficients (degree < n/2),  v  the high-half,
+# and  ψ  is the 2-to-1 rational map from the good isogeny.
+#
+# Given f evaluated on the full n-point domain S, we want to recover
+# evaluations of u and v on the half-size image domain S' = ψ(S).
+#
+# IMPORTANT: this is NOT a simple pointwise 2×2 solve.
+#
+# In the classic FFT world, f(ω^i) = u(ω^{2i}) + ω^i · v(ω^{2i}), and
+# f(-ω^i) = u(ω^{2i}) - ω^i · v(ω^{2i}), so you can solve pointwise:
+#   u(ω^{2i}) = (f(ω^i) + f(-ω^i)) / 2
+#   v(ω^{2i}) = (f(ω^i) - f(-ω^i)) / (2·ω^i)
+#
+# In the ECFFT, the evaluation domain has no such additive structure.
+# Instead, the decomposition uses the FFTree's modular reduction
+# machinery (MOD = REDC∘REDC, which relies on precomputed vanishing
+# polynomial tables and the extend operation).
+#
+# Concretely, to decompose evaluations ⟨f ≀ S⟩ into ⟨u ≀ S'⟩ and ⟨v ≀ S'⟩:
+#
+#   1.  u_on_S0 = modular_reduce(evals, xnn_s, z0z0_rem_xnn_s)[0::2]
+#       This computes ⟨f mod x^{n/2} ≀ S₀⟩ = ⟨u ≀ S'⟩
+#
+#   2.  v_on_S0[i] = (evals[2i] − u_on_S0[i]) / xnn_s[2i]
+#       Solving for v at each S₀ point.
+#
+# This is exactly the first step of EXIT (before the recursive call).
+# The result lives on the subtree domain, ready for the next folding round.
+#
+# FRI folding with random challenge α:
+#
+#     f_folded = u + α · v     (degree < n/2, evaluated on S')
+#
+# Functions:
+#   ecfft_decompose_step(evals, tree) → (u_evals, v_evals)
+#   ecfft_fold_step(evals, tree, α)  → folded_evals
+#   ecfft_fold(evals, tree, [α₁, α₂, …]) → fully-folded evals
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def ecfft_decompose_step(evals, tree):
+    """
+    Decompose evaluations of f into evaluations of (u, v) on the image domain.
+
+    Given  f  of degree < n  evaluated on the full domain of ``tree`` (size n,
+    in leaf order), returns (u_evals, v_evals) each of size n/2, such that:
+
+        f(x) = u(ψ(x)) + x^{n/2} · v(ψ(x))
+
+    with deg(u) < n/2 and deg(v) < n/2.
+
+    u_evals and v_evals are evaluations on the subtree domain (= the ψ-image
+    of the S₀ moiety), in the subtree's leaf order — ready to be fed into the
+    next folding round or into ``tree.subtree.exit()`` to recover coefficients.
+
+    This is the first (non-recursive) step of EXIT.
+
+    Parameters
+    ----------
+    evals : list of int
+        [f(s₀), f(s₁), …, f(s_{n-1})] in leaf order (size n).
+    tree : FFTree
+        The FFTree whose domain matches the evaluations.
+
+    Returns
+    -------
+    u_evals : list of int
+        [u(y₀), u(y₁), …, u(y_{n/2-1})] on the subtree domain.
+    v_evals : list of int
+        [v(y₀), v(y₁), …, v(y_{n/2-1})] on the subtree domain.
+    """
+    n = len(evals)
+    t = tree._subtree_with_size(n)
+
+    # Step 1: ⟨f mod x^{n/2} ≀ S₀⟩  via modular reduction
+    u_evals = t._modular_reduce_impl(evals, t.xnn_s, t.z0z0_rem_xnn_s)[0::2]
+
+    # Step 2: v₀[i] = (f(S₀[i]) − u(S₀[i])) / S₀[i]^{n/2}
+    e0 = evals[0::2]
+    xnn0_inv = t.xnn_s_inv[0::2]
+    v_evals = [fmul(fsub(e, u), xi) for e, u, xi in zip(e0, u_evals, xnn0_inv)]
+
+    return u_evals, v_evals
+
+
+def ecfft_fold_step(evals, tree, alpha):
+    """
+    FRI-like fold: combine f's low/high halves with a random challenge α.
+
+    Given  f  of degree < n  evaluated on the full domain of ``tree``
+    (size n, in leaf order), returns evaluations of:
+
+        f_folded = u + α · v       (degree < n/2)
+
+    on the half-size subtree domain (size n/2).
+
+    This is the ECFFT analogue of the classic FRI folding step::
+
+        Classic FRI:   f_folded(x²) = f_even(x²) + α · f_odd(x²)
+        ECFFT fold:    f_folded(y)  = u(y) + α · v(y)
+
+    where  f(x) = u(ψ(x)) + x^{n/2} · v(ψ(x)).
+
+    Parameters
+    ----------
+    evals : list of int
+        [f(s₀), f(s₁), …, f(s_{n-1})] in leaf order (size n).
+    tree : FFTree
+        The FFTree whose domain matches the evaluations.
+    alpha : int
+        The random verifier challenge in Fq.
+
+    Returns
+    -------
+    folded : list of int
+        [f_folded(y₀), …, f_folded(y_{n/2-1})] on the subtree domain (size n/2).
+    """
+    u_evals, v_evals = ecfft_decompose_step(evals, tree)
+    return [fadd(u, fmul(alpha, v)) for u, v in zip(u_evals, v_evals)]
+
+
+def ecfft_fold(evals, tree, alphas):
+    """
+    Multi-round FRI-like fold: repeatedly fold with a sequence of challenges.
+
+    Starting from evaluations of f on a domain of size n, applies
+    ``len(alphas)`` folding steps, each halving the domain.  Returns
+    evaluations on a domain of size  n / 2^{len(alphas)}.
+
+    After all rounds, the result can be checked against a direct evaluation
+    of the expected folded polynomial.
+
+    Parameters
+    ----------
+    evals : list of int
+        [f(s₀), …, f(s_{n-1})] in leaf order (size n).
+    tree : FFTree
+        An FFTree with at least n leaves.
+    alphas : list of int
+        Verifier challenges, one per folding round.
+
+    Returns
+    -------
+    folded : list of int
+        Evaluations of the fully-folded polynomial (size n / 2^len(alphas)).
+    """
+    current = list(evals)
+    t = tree._subtree_with_size(len(current))
+    for alpha in alphas:
+        current = ecfft_fold_step(current, t, alpha)
+        if t.subtree is not None:
+            t = t.subtree
+    return current
 
 
 if __name__ == "__main__":
