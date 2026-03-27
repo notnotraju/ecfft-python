@@ -72,33 +72,66 @@ f(x) = u(ψ(x)) + x^{n/2} · v(ψ(x))
 
 where u holds the low coefficients and v the high. See `_enter_impl` and `_exit_impl` in the source.
 
-## FRI-like folding
+## FRI folding (ECFFT Part II style)
 
-The library includes FRI-style folding operations for building proof systems over non-FFT-friendly fields:
+The library provides two styles of FRI-like folding:
+
+### ECFFT2 FRI hash (§12) — use this for FRI protocols
+
+The correct pointwise fold from ECFFT Part II (BSCKL22, Appendix B.2). Each output depends on exactly 2 inputs, enabling O(1) per-query verification.
 
 ```python
-from ecfft_algorithms import build_fftree, ecfft_decompose_step, ecfft_fold_step, ecfft_fold
+from ecfft_algorithms import build_fri_domains, ecfri_fold_step, ecfri_fold, ecfri_verify_query
 from ecfft_params_2_20 import params
 
-tree, _ = build_fftree(params, log_n=5)  # domain of size 32
+# Build FRI domain layers: L_0 → L_1 → ... → L_k via ψ
+layers, psis = build_fri_domains(params, log_n=5)  # L_0 has 32 elements
 
-# Evaluate a polynomial
+# Evaluate a polynomial on L_0
+from ecfft_algorithms import poly_eval
 coeffs = list(range(1, 33))
-evals = tree.enter(coeffs)
+word = [poly_eval(coeffs, x) for x in layers[0]]
 
-# Decompose: f(x) = u(ψ(x)) + x^{n/2} · v(ψ(x))
-# Returns evaluations of u, v on the half-size image domain
-u_evals, v_evals = ecfft_decompose_step(evals, tree)
+# One FRI fold step (degree bound 32 → 16)
+z = 42
+folded = ecfri_fold_step(word, layers, round_idx=0, degree_bound=32, z=z)
+# folded lives on layers[1] (size 16)
 
-# FRI fold with a random challenge α
-alpha = 42
-folded = ecfft_fold_step(evals, tree, alpha)  # evals of u + α·v (size 16)
+# Verifier checks a single query (O(1)):
+j = 5  # query pair index
+expected = ecfri_verify_query(layers, 0, 32, j, word[j], word[j + 16], z)
+assert expected == folded[j]
 
 # Multi-round fold
-folded = ecfft_fold(evals, tree, [42, 99, 7])  # 3 rounds: 32 → 16 → 8 → 4
+folded = ecfri_fold(word, layers, degree_bound=32, challenges=[42, 99, 7])
 ```
 
-Note: unlike the classic FFT where folding is a pointwise 2×2 solve, the ECFFT decomposition uses the FFTree's modular reduction machinery internally. See the §11 comments in `ecfft_algorithms.py` for details.
+### Global ECFFT decomposition (§11) — for ENTER/EXIT, not FRI
+
+The Part I decomposition `f(x) = u(ψ(x)) + x^{n/2}·v(ψ(x))` uses the FFTree's modular reduction machinery. It is O(n log n) and **not** pointwise — the fold matrix is dense. This is what ENTER/EXIT use internally, but is NOT suitable for FRI verification. See §11 comments in source.
+
+```python
+from ecfft_algorithms import build_fftree, ecfft_decompose_step, ecfft_fold_step
+from ecfft_params_2_20 import params
+
+tree, _ = build_fftree(params, log_n=5)
+evals = tree.enter(list(range(1, 33)))
+u_evals, v_evals = ecfft_decompose_step(evals, tree)  # global, O(n log n)
+```
+
+## Group-valued BaseFold (§13)
+
+The library includes group-valued FRI folding for the BaseFold protocol from [eprint 2025/1325](https://eprint.iacr.org/2025/1325). This replaces the O(n) MSM in IPA verification with O(λ·log²n) scalar muls.
+
+```python
+from ecfft_algorithms import build_fri_domains, basefold_group_fold_step, basefold_verify_query
+
+layers, _ = build_fri_domains(params, log_n=5)
+# g_word = list of (x, y) curve points on L_0
+# g_folded = basefold_group_fold_step(g_word, layers, 0, 32, z)
+```
+
+See §13 in `ecfft_algorithms.py` for the full protocol description.
 
 ## Requirements
 
