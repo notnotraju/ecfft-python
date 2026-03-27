@@ -1,104 +1,65 @@
 # ecfft-python
 
-Pure-Python implementation of the **Elliptic Curve Fast Fourier Transform** (ECFFT) over the BN-254 base field.
+Pure-Python implementation of the **Elliptic Curve Fast Fourier Transform** (ECFFT) over the BN-254 base field, organized around the **group-valued BaseFold** protocol from [eprint 2025/1325](https://eprint.iacr.org/2025/1325).
 
-This is a literate, dependency-free implementation of the ECFFT algorithms from:
+This is a literate, dependency-free implementation based on:
 
-- [ECFFT Part I: Fast Polynomial Algorithms over all Finite Fields](https://arxiv.org/pdf/2107.08473.pdf) (Eli Ben-Sasson, Dan Carmon, Yair Frankel, Swastik Kopparty)
-- [ECFFT Part II](https://www.math.toronto.edu/swastik/ECFFT2.pdf) (Eli Ben-Sasson, Dan Carmon, Swastik Kopparty, David Levit)
+- [ECFFT Part I: Fast Polynomial Algorithms over all Finite Fields](https://arxiv.org/pdf/2107.08473.pdf) (Ben-Sasson, Carmon, Frankel, Kopparty)
+- [ECFFT Part II](https://www.math.toronto.edu/swastik/ECFFT2.pdf) (Ben-Sasson, Carmon, Kopparty, Levit)
+- [Revisiting the IPA-sumcheck connection](https://eprint.iacr.org/2025/1325) (Eagen, Gabizon)
 
-Based on the Rust implementation at [andrewmilson/ecfft](https://github.com/andrewmilson/ecfft).
+Rust reference: [andrewmilson/ecfft](https://github.com/andrewmilson/ecfft).
 
-## Why?
+## The problem
 
-The standard FFT requires the field to contain roots of unity of large 2-power order (i.e., the field size minus 1 must be divisible by a large power of 2). The BN-254 base field does **not** have this property. The ECFFT replaces roots of unity with x-coordinates of points on an elliptic curve, using isogenies in place of the squaring map.
+In IPA verification, the "decide" step computes G(r) = sum_i s_i * G_i — an O(n) MSM that dominates recursive verification cost. Group BaseFold replaces this with a FRI-like protocol over **group elements**, reducing the verifier to O(lambda * log^2 n) scalar multiplications via Merkle-committed fold oracles and random spot-checks.
 
-This lets you do O(n log² n) polynomial evaluation and interpolation over **any** prime field.
+The ECFFT is what makes this work over BN-254: the base field has no roots of unity of large 2-power order, so the standard FFT doesn't apply. The ECFFT replaces roots of unity with x-coordinates of elliptic curve points, and the squaring map x -> x^2 with a rational map psi(x) = (x - b)^2/x induced by a good isogeny.
 
 ## Files
 
-| File | Description |
-|------|-------------|
-| `ecfft_algorithms.py` | Core algorithms: `FFTree`, ENTER, EXIT, EXTEND, DEGREE, and all supporting machinery (field arithmetic, elliptic curve group law, isogenies, binary trees, matrix operations) |
+| File | Purpose |
+|------|---------|
+| `ecfft_algorithms.py` | **Core**: field arithmetic, curves, isogenies, FRI domains, ECFFT2 pointwise fold, group-valued BaseFold |
+| `ecfft_fftree.py` | **General ECFFT**: FFTree with ENTER/EXIT/EXTEND/DEGREE, global Part I decomposition |
 | `ecfft_params_2_18.py` | Curve parameters with a cyclic 2^18 subgroup |
 | `ecfft_params_2_19.py` | Curve parameters with a cyclic 2^19 subgroup |
 | `ecfft_params_2_20.py` | Curve parameters with a cyclic 2^20 subgroup |
-| `demo.ipynb` | Interactive walkthrough of the key ideas |
+| `demo.ipynb` | Interactive walkthrough |
 
-## Quick start
-
-```python
-from ecfft_algorithms import build_fftree, poly_eval
-from ecfft_params_2_20 import params
-
-# Build an FFTree with a domain of size 2^5 = 32
-tree, leaves = build_fftree(params, log_n=5)
-
-# Coefficients of a polynomial f(x) = 1 + 2x + 3x² + ... + 32x³¹
-coeffs = list(range(1, 33))
-
-# ENTER: coefficient representation → evaluation representation  O(n log² n)
-evals = tree.enter(coeffs)
-
-# EXIT: evaluation representation → coefficient representation  O(n log² n)
-recovered = tree.exit(evals)
-assert recovered == coeffs
-
-# DEGREE: compute degree from evaluations  O(n log n)
-deg = tree.degree(evals)
-assert deg == 31
-
-# EXTEND: given evaluations on one moiety, compute on the other  O(n log n)
-domain = tree.eval_domain()
-s0_evals = [poly_eval(coeffs[:16], x) for x in domain[0::2]]  # deg < n/2
-s1_evals = tree.extend(s0_evals, 'S1')
-```
-
-## The FFT analogy
-
-In the classic radix-2 FFT, the key decomposition is:
-
-```
-f(x) = f_even(x²) + x · f_odd(x²)
-```
-
-The squaring map x ↦ x² is 2-to-1 on roots of unity: it sends ω^i and ω^{i+n/2} to the same point.
-
-The ECFFT replaces the squaring map with ψ(x) = (x − b)²/x, a rational map induced by a "good isogeny" on an elliptic curve. ψ is also 2-to-1 on the evaluation domain. The decomposition becomes:
-
-```
-f(x) = u(ψ(x)) + x^{n/2} · v(ψ(x))
-```
-
-where u holds the low coefficients and v the high. See `_enter_impl` and `_exit_impl` in the source.
-
-## FRI folding (ECFFT Part II style)
-
-The library provides two styles of FRI-like folding:
-
-### ECFFT2 FRI hash (§12) — use this for FRI protocols
-
-The correct pointwise fold from ECFFT Part II (BSCKL22, Appendix B.2). Each output depends on exactly 2 inputs, enabling O(1) per-query verification.
+## Quick start: Group BaseFold
 
 ```python
-from ecfft_algorithms import build_fri_domains, ecfri_fold_step, ecfri_fold, ecfri_verify_query
+from ecfft_algorithms import build_fri_domains, basefold_group_fold_step, basefold_verify_query
 from ecfft_params_2_20 import params
 
-# Build FRI domain layers: L_0 → L_1 → ... → L_k via ψ
+# Build FRI domain layers: L_0 -> L_1 -> ... -> L_k via psi
 layers, psis = build_fri_domains(params, log_n=5)  # L_0 has 32 elements
 
+# g_word = list of (x, y) group elements on L_0
+# g_folded = basefold_group_fold_step(g_word, layers, round_idx=0, degree_bound=32, z=42)
+# expected = basefold_verify_query(layers, 0, 32, j, g_word[j], g_word[j+16], z=42)
+# assert expected == g_folded[j]  # O(1) per-query verification
+```
+
+## Quick start: Scalar FRI fold
+
+```python
+from ecfft_algorithms import build_fri_domains, ecfri_fold_step, ecfri_fold, ecfri_verify_query, poly_eval
+from ecfft_params_2_20 import params
+
+layers, psis = build_fri_domains(params, log_n=5)
+
 # Evaluate a polynomial on L_0
-from ecfft_algorithms import poly_eval
 coeffs = list(range(1, 33))
 word = [poly_eval(coeffs, x) for x in layers[0]]
 
-# One FRI fold step (degree bound 32 → 16)
+# One FRI fold step (degree bound 32 -> 16)
 z = 42
 folded = ecfri_fold_step(word, layers, round_idx=0, degree_bound=32, z=z)
-# folded lives on layers[1] (size 16)
 
 # Verifier checks a single query (O(1)):
-j = 5  # query pair index
+j = 5
 expected = ecfri_verify_query(layers, 0, 32, j, word[j], word[j + 16], z)
 assert expected == folded[j]
 
@@ -106,32 +67,40 @@ assert expected == folded[j]
 folded = ecfri_fold(word, layers, degree_bound=32, challenges=[42, 99, 7])
 ```
 
-### Global ECFFT decomposition (§11) — for ENTER/EXIT, not FRI
+## Quick start: General ECFFT (FFTree)
 
-The Part I decomposition `f(x) = u(ψ(x)) + x^{n/2}·v(ψ(x))` uses the FFTree's modular reduction machinery. It is O(n log n) and **not** pointwise — the fold matrix is dense. This is what ENTER/EXIT use internally, but is NOT suitable for FRI verification. See §11 comments in source.
+For polynomial evaluation and interpolation without roots of unity:
 
 ```python
-from ecfft_algorithms import build_fftree, ecfft_decompose_step, ecfft_fold_step
+from ecfft_fftree import build_fftree
 from ecfft_params_2_20 import params
 
-tree, _ = build_fftree(params, log_n=5)
-evals = tree.enter(list(range(1, 33)))
-u_evals, v_evals = ecfft_decompose_step(evals, tree)  # global, O(n log n)
+tree, leaves = build_fftree(params, log_n=5)
+
+coeffs = list(range(1, 33))
+evals = tree.enter(coeffs)        # O(n log^2 n) evaluation
+recovered = tree.exit(evals)      # O(n log^2 n) interpolation
+assert recovered == coeffs
+
+deg = tree.degree(evals)           # O(n log n) degree computation
+assert deg == 31
 ```
 
-## Group-valued BaseFold (§13)
+## How the ECFFT fold works
 
-The library includes group-valued FRI folding for the BaseFold protocol from [eprint 2025/1325](https://eprint.iacr.org/2025/1325). This replaces the O(n) MSM in IPA verification with O(λ·log²n) scalar muls.
+In the classic FFT, the squaring map x -> x^2 is 2-to-1 on roots of unity, and FRI folding exploits this: f(omega^i) and f(-omega^i) share the same even/odd decomposition values, so folding is a pointwise 2x2 operation.
 
-```python
-from ecfft_algorithms import build_fri_domains, basefold_group_fold_step, basefold_verify_query
+The ECFFT replaces the squaring map with psi(x) = (x - b)^2/x, which is 2-to-1 on evaluation domains built from curve points. For a pair (s_0, s_1) with psi(s_0) = psi(s_1) and degree bound d:
 
-layers, _ = build_fri_domains(params, log_n=5)
-# g_word = list of (x, y) curve points on L_0
-# g_folded = basefold_group_fold_step(g_word, layers, 0, 32, z)
+```
+e = d/2 - 1
+a = P(s_0) / s_0^e          (normalize by denominator power)
+b = P(s_1) / s_1^e
+slope = (b - a) / (s_1 - s_0)
+H_z[P](t) = a + slope * (z - s_0)    (= P_0(t) + z * P_1(t))
 ```
 
-See §13 in `ecfft_algorithms.py` for the full protocol description.
+This is **pointwise**: each output depends on exactly 2 inputs. This is what makes FRI verification O(1) per query — and what makes group BaseFold possible, since scalar-multiplying a group element is cheap but a dense matrix-vector product over group elements is not.
 
 ## Requirements
 

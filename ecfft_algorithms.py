@@ -1,75 +1,39 @@
 """
-ECFFT: Elliptic Curve Fast Fourier Transform — Algorithms
-==========================================================
+ECFFT for Group BaseFold
+=========================
 
-A pure-Python implementation of the ECFFT, based on the Rust implementation
-at https://github.com/andrewmilson/ecfft.
+Pure-Python implementation of the ECFFT machinery needed for the group-valued
+BaseFold protocol from `eprint 2025/1325 <https://eprint.iacr.org/2025/1325>`_
+(Eagen & Gabizon, "Revisiting the IPA-sumcheck connection").
 
 References:
 
   * **ECFFT Part I**:  https://arxiv.org/pdf/2107.08473.pdf
   * **ECFFT Part II**: https://www.math.toronto.edu/swastik/ECFFT2.pdf
+  * **BaseFold**:      https://eprint.iacr.org/2025/1325
 
 We work over the BN-254 base field  Fq,  q given below.
 
 
-The FFT analogy — even/odd decomposition
-------------------------------------------
+Overview
+--------
 
-In the classic radix-2 FFT over a domain D = {ω⁰, ω¹, …, ω^{n-1}} where ω
-is a primitive n-th root of unity, the key decomposition is::
+The standard FFT requires roots of unity of large 2-power order.  The BN-254
+base field has no such roots.  The ECFFT replaces the squaring map  x ↦ x²
+with a rational map  ψ(x) = (x − b)²/x  induced by a good isogeny on an
+elliptic curve.  ψ is 2-to-1 on evaluation domains built from curve points,
+giving the same recursive halving that powers the FFT.
 
-    f(x) = f_even(x²) + x · f_odd(x²)
+This file provides:
 
-The squaring map  x ↦ x²  is 2-to-1 on D:  it sends ω^i and ω^{i+n/2} to the
-same point (ω²)^i.  This halves the domain, and we recurse.
+  1. **Field arithmetic** over Fq  (§1)
+  2. **Elliptic curve** infrastructure: good curves, points, isogenies  (§2–§3)
+  3. **FRI domain construction**: the layer sequence  L₀ → L₁ → ⋯ → Lₖ  (§4)
+  4. **ECFFT Part II pointwise FRI fold**: the correct fold for protocols  (§5)
+  5. **Group-valued BaseFold**: FRI folding over curve points  (§6)
 
-The ECFFT replaces the squaring map with the rational map  ψ(x) = (x−b)²/x
-induced by a good isogeny on an elliptic curve.  ψ is also 2-to-1 on the
-evaluation domain.  The decomposition becomes::
-
-    f(x) = u(ψ(x)) + x^{n/2} · v(ψ(x))     [ENTER]
-
-where  u  holds the low coefficients (indices 0..n/2)  and  v  holds the high
-coefficients (indices n/2..n).  This is the split in ``_enter_impl``.
-
-The inverse (``_exit_impl``) recovers u, v from evaluations via modular
-reduction:  u = f mod x^{n/2},  then  v = (f − u) / x^{n/2}.
-
-The ``_extend_impl`` operation (Lemma 3.2 of ECFFT I) plays the role of the
-"twiddle factor" in the classic FFT: given evaluations of a polynomial on one
-half of the domain (moiety S₀), it computes the evaluations on the other half
-(moiety S₁) in O(n log n) via a matrix-based decompose/recurse/recombine
-strategy.
-
-
-Pointwise folding  (FRI-like decomposition)
----------------------------------------------
-
-The key operation for FRI-like protocols: given f(x) = u(ψ(x)) + x^{n/2} · v(ψ(x))
-evaluated on an n-point domain, decompose into evaluations of u and v on the
-half-size ψ-image domain, then combine with a random challenge α::
-
-    f_folded(y) = u(y) + α · v(y)      (degree < n/2, on n/2 points)
-
-Unlike the classic FFT where folding is a pointwise 2×2 solve (because
-f(ω^i) and f(−ω^i) share the same u, v values), the ECFFT decomposition
-requires the FFTree's **modular reduction** machinery.  The reason is that
-the ECFFT's ENTER recombines u and v via the extend operation, which is a
-non-local algebraic operation — not a simple per-pair formula.
-
-The correct decomposition (one level of EXIT) is::
-
-    u_on_S0  = modular_reduce(⟨f ≀ S⟩,  ⟨x^{n/2} ≀ S⟩,  ⟨Z₀² mod x^{n/2} ≀ S⟩)[S₀]
-    v_on_S0  = (f(S₀) − u(S₀)) / S₀^{n/2}
-
-Available as:
-
-  * ``ecfft_decompose_step(evals, tree)`` → (u_evals, v_evals) on the subtree domain
-  * ``ecfft_fold_step(evals, tree, alpha)`` → evaluations of u + α·v
-  * ``ecfft_fold(evals, tree, [α₁, α₂, …])`` → multi-round folding
-
-See §11 at the bottom of this file.
+For the general-purpose FFTree (ENTER/EXIT/EXTEND/DEGREE) and the global
+Part I decomposition, see ``ecfft_fftree.py``.
 
 
 §1  Field Arithmetic
@@ -257,904 +221,36 @@ def build_isogeny_chain(gen, k):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# §4  BinaryTree — heap-layout binary tree,  mirrors src/utils.rs
-# ═══════════════════════════════════════════════════════════════════════════
-
-class BinaryTree:
-    """
-    Flat array of length 2n storing a complete binary tree with n leaves::
-
-             a            ← layer d-1 = root    (data[1])
-            / \\
-           b   c          ← layer d-2           (data[2..4])
-          / \\ / \\
-         w  x y  z        ← layer 0   = leaves  (data[n..2n])
-
-    Layout: ``data = [unused, root, layer_{d-2}, …, leaves]``.
-    ``leaves = data[n:]``.  ``get_layer(i)`` has  n >> i  elements.
-    """
-    def __init__(self, data):
-        assert len(data) > 0 and (len(data) & (len(data) - 1)) == 0
-        self.data = list(data)
-
-    @property
-    def n(self):
-        """Number of leaves."""
-        return len(self.data) // 2
-
-    def leaves(self):        return self.data[self.n:]
-    def num_layers(self):    return self.n.bit_length()   # = log2(2n)
-
-    def get_layer(self, i):
-        """Layer i: layer 0 = leaves (size n), layer 1 = size n/2, …"""
-        sz = self.n >> i
-        return self.data[sz : 2 * sz]
-
-    def set_layer(self, i, vals):
-        sz = self.n >> i
-        self.data[sz : 2 * sz] = vals
-
-    def get_layers(self):
-        """Return [layer_0 (leaves), layer_1, …, layer_{d-1} (root)].
-
-        Total number of layers = log₂(n) + 1  (for n a power of 2).
-        """
-        log_n = (self.n - 1).bit_length() if self.n > 1 else 0
-        return [self.get_layer(i) for i in range(log_n + 1)]
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# §5  Mat2x2 — 2×2 matrices over Fq
-# ═══════════════════════════════════════════════════════════════════════════
-
-class Mat2x2:
-    __slots__ = ('a', 'b', 'c', 'd')
-    def __init__(self, a, b, c, d):
-        self.a, self.b, self.c, self.d = a % q, b % q, c % q, d % q
-    @staticmethod
-    def identity():
-        return Mat2x2(1, 0, 0, 1)
-    def det(self):
-        return fsub(fmul(self.a, self.d), fmul(self.b, self.c))
-    def inv(self):
-        di = finv(self.det())
-        return Mat2x2(fmul(self.d, di), fmul(fneg(self.b), di),
-                       fmul(fneg(self.c), di), fmul(self.a, di))
-    def __mul__(self, v):
-        """Mat2x2 * (v0, v1) → (w0, w1)"""
-        return (fadd(fmul(self.a, v[0]), fmul(self.b, v[1])),
-                fadd(fmul(self.c, v[0]), fmul(self.d, v[1])))
-    def __repr__(self):
-        return f"[[{self.a},{self.b}],[{self.c},{self.d}]]"
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# §6  FFTree — the core data structure,  mirrors src/fftree.rs
-# ═══════════════════════════════════════════════════════════════════════════
-
-class FFTree:
-    """
-    The ECFFT "FFTree" — a precomputed structure over an evaluation domain S
-    of size n (a power of 2).
-
-    **Domain layout (leaf order):**
-
-    Leaves are the x-coordinates  [x(O), x(O+G), x(O+2G), …, x(O+(n-1)G)]
-    laid out sequentially.
-
-    **Moiety pairing:**
-
-    At each tree level, the first half pairs with the second half under the
-    corresponding ψ map.  At the leaf level::
-
-        ψ₀(leaf[i]) = ψ₀(leaf[i + n/2])     for i = 0, …, n/2 − 1
-
-    This holds because  (n/2)·G = T = (0,0)  is the kernel of ψ₀.
-
-    **Subtree:**
-
-    The subtree is formed by taking the *even-indexed* elements from every
-    layer (``step_by(2)``), giving a tree of half the size over the ψ-image
-    domain.  It uses ``rational_maps[:-1]`` (all maps except the last).
-
-    **Naming conventions (matching the Rust):**
-
-    =========== ============================================================
-    ``f``       BinaryTree of domain x-coordinates
-    ``xnn_s``   evaluation table  ⟨X^{n/2} ≀ S⟩  (S = all leaves)
-    ``z0_s1``   ⟨Z₀ ≀ S₁⟩  — vanishing poly of S₀ evaluated on S₁
-    ``z1_s0``   ⟨Z₁ ≀ S₀⟩
-    =========== ============================================================
-
-    S₀ = even-indexed leaves,  S₁ = odd-indexed leaves.
-    """
-
-    def __init__(self, leaves, rational_maps):
-        """
-        Build an FFTree from raw leaves and the chain of ψ rational maps.
-        This mirrors ``FFTree::new`` in fftree.rs.
-        """
-        n = len(leaves)
-        assert n > 0 and (n & (n - 1)) == 0
-        log_n = n.bit_length() - 1
-        assert log_n == len(rational_maps)
-
-        # --- Build the BinaryTree of domain x-coords ---
-        data = [0] * (2 * n)
-        data[n:] = list(leaves)
-        self.f = BinaryTree(data)
-
-        # Generate internal nodes by applying rational maps layer by layer.
-        # Layer 0 = leaves.  Layer 1 is built from layer 0 via rational_maps[0], etc.
-        for k, rmap in enumerate(rational_maps):
-            prev = self.f.get_layer(k)          # size n >> k
-            layer_sz = len(prev) // 2           # size of the layer we're building
-            layer = [0] * layer_sz
-            for i in range(layer_sz):
-                layer[i] = rmap(prev[i])
-                # Assertion: rmap(prev[i]) == rmap(prev[i + layer_sz])
-                assert layer[i] == rmap(prev[i + layer_sz]), \
-                    f"ψ pairing broken at level {k}, index {i}"
-            self.f.set_layer(k + 1, layer)
-
-        self.rational_maps = list(rational_maps)
-
-        # --- Delegate to _from_tree for all the precomputation ---
-        self._from_tree()
-
-    def _from_tree(self):
-        """
-        Precompute everything needed for ENTER / EXIT / EXTEND / etc.
-        Mirrors ``FFTree::from_tree`` in fftree.rs.
-        """
-        n = self.f.n                       # number of leaves
-        log_n = n.bit_length() - 1
-        s = self.f.leaves()                # layer 0
-
-        # --- subtree (recursive) ---
-        self.subtree = self._derive_subtree()
-
-        # --- xnn: ⟨X^{n/2} ≀ S⟩ and its inverse ---
-        nn = n // 2
-        self.xnn_s     = [fpow(x, nn) for x in s]
-        self.xnn_s_inv = batch_inv(list(self.xnn_s))
-
-        # --- S₀, S₁ (even / odd indexed leaves) ---
-        s0 = s[0::2]
-        s1 = s[1::2]
-
-        # --- Decomposition / recombination matrices (Lemma 3.2, ECFFT I) ---
-        # One BinaryTree for recombine, one for decompose, each with n entries.
-        # We store them as flat lists-of-Mat2x2, indexed like BinaryTree layers.
-        # Layer k has n >> (k+1) matrices.  (Same indexing as f layers.)
-        layers = self.f.get_layers()       # layers[0] = leaves, etc.
-        self.recombine = []   # list of lists of Mat2x2, one per tree layer
-        self.decompose = []
-
-        for k in range(log_n):
-            lyr = layers[k]                 # domain values at this level
-            d = len(lyr) // 2               # = n >> (k+1)
-            if d <= 1:
-                self.recombine.append([])
-                self.decompose.append([])
-                continue
-            rmap = self.rational_maps[k]
-            v_poly = rmap.den               # denominator polynomial
-            exp = d // 2 - 1
-            if exp < 0: exp = 0
-            rmats = []
-            dmats = []
-            for i in range(d):              # d matrices, pairing l[i] with l[i+d]
-                s0_val = lyr[i]
-                s1_val = lyr[i + d]
-                v0 = fpow(poly_eval(v_poly, s0_val), exp)
-                v1 = fpow(poly_eval(v_poly, s1_val), exp)
-                m = Mat2x2(v0, fmul(s0_val, v0), v1, fmul(s1_val, v1))
-                rmats.append(m)
-                dmats.append(m.inv())
-            self.recombine.append(rmats)
-            self.decompose.append(dmats)
-
-        # --- Vanishing polynomial evaluation tables ---
-        self.z0_s1 = []
-        self.z1_s0 = []
-        if n > 2:
-            st = self.subtree
-            # z0_s1 from subtree's vanishing data (O(n log n))
-            st_z0_s0 = []
-            st_z1_s0 = []
-            for y in st.z0_s1:
-                st_z0_s0.extend([0, y])
-            for y in st.z1_s0:
-                st_z1_s0.extend([y, 0])
-            st_z0_s1 = self._extend_impl(st_z0_s0, 'S1')
-            st_z1_s1 = self._extend_impl(st_z1_s0, 'S1')
-            self.z0_s1 = [fmul(a, b) for a, b in zip(st_z0_s1, st_z1_s1)]
-            # z1_s0 via vanish
-            z1_s = self._vanish_impl(list(s1))
-            self.z1_s0 = z1_s[0::2]
-        elif n == 2:
-            self.z0_s1 = [fsub(s1[0], s0[0])]
-            self.z1_s0 = [fsub(s0[0], s1[0])]
-
-        self.z0_inv_s1 = batch_inv(list(self.z0_s1)) if self.z0_s1 else []
-        self.z1_inv_s0 = batch_inv(list(self.z1_s0)) if self.z1_s0 else []
-
-        # --- z0z0_rem_xnn, z1z1_rem_xnn (for EXIT's modular reduction) ---
-        self.z0z0_rem_xnn_s = []
-        self.z1z1_rem_xnn_s = []
-        if n > 2:
-            nnnn = n // 4
-            xnnnn_s     = [fpow(x, nnnn) for x in s]
-            xnnnn_s_inv = batch_inv(list(xnnnn_s))
-            st = self.subtree
-            # z0z0_rem_xnnnn_s0
-            z0_rem_xnnnn_sq_s0 = [fmul(a, b)
-                                  for a, b in zip(st.z0z0_rem_xnn_s, st.z1z1_rem_xnn_s)]
-            z0z0_rem_xnnnn_s0 = st._modular_reduce_impl(
-                z0_rem_xnnnn_sq_s0, st.xnn_s, st.z0z0_rem_xnn_s)
-            z0z0_rem_xnnnn_s1 = self._extend_impl(z0z0_rem_xnnnn_s0, 'S1')
-            z0z0_rem_xnnnn_s = []
-            for a, b in zip(z0z0_rem_xnnnn_s0, z0z0_rem_xnnnn_s1):
-                z0z0_rem_xnnnn_s.extend([a, b])
-            # z0_s interleaved: [0, z0_s1[0], 0, z0_s1[1], ...]
-            z0_s = []
-            for y in self.z0_s1:
-                z0_s.extend([0, y])
-            z0_rem_xnn_s = [fsub(z, x) for z, x in zip(z0_s, self.xnn_s)]
-            z0_rem_xnn_sq_s = [fmul(y, y) for y in z0_rem_xnn_s]
-            z0_rem_xnn_sq_div_xnnnn_s = [
-                fmul(fsub(sq, rem), inv)
-                for sq, rem, inv in zip(z0_rem_xnn_sq_s, z0z0_rem_xnnnn_s, xnnnn_s_inv)
-            ]
-            z0z0_div_xnnnn_rem_xnnnn_s = self._modular_reduce_impl(
-                z0_rem_xnn_sq_div_xnnnn_s, xnnnn_s, z0z0_rem_xnnnn_s)
-            self.z0z0_rem_xnn_s = [
-                fadd(rem, fmul(xn, div))
-                for rem, div, xn in zip(z0z0_rem_xnnnn_s, z0z0_div_xnnnn_rem_xnnnn_s, xnnnn_s)
-            ]
-            # z1z1
-            z1_s = []
-            for y in self.z1_s0:
-                z1_s.extend([y, 0])
-            z1_rem_xnn_s = [fsub(z, x) for z, x in zip(z1_s, self.xnn_s)]
-            z1z1 = [fmul(y, y) for y in z1_rem_xnn_s]
-            self.z1z1_rem_xnn_s = self._modular_reduce_impl(
-                z1z1, self.xnn_s, self.z0z0_rem_xnn_s)
-        elif n == 2:
-            self.z0z0_rem_xnn_s = [fmul(s0[0], s0[0])] * 2
-            self.z1z1_rem_xnn_s = [fmul(s1[0], s1[0])] * 2
-
-    # ───────────────────────────────────────────────────────────────────
-    # §6.1  Subtree derivation  (mirrors derive_subtree)
-    # ───────────────────────────────────────────────────────────────────
-
-    def _derive_subtree(self):
-        """
-        Build the subtree by taking even-indexed elements from every layer
-        and dropping the last rational map.
-        """
-        n = self.f.n
-        if n < 2:
-            return None
-        sub_n = n // 2
-        sub_data = [0] * (2 * sub_n)
-        sub_tree = BinaryTree(sub_data)
-        parent_layers = self.f.get_layers()
-        # For each layer, take even-indexed elements
-        log_sub = sub_n.bit_length() - 1
-        for k in range(log_sub + 1):
-            parent_layer = parent_layers[k]
-            sub_layer = parent_layer[0::2]
-            sub_tree.set_layer(k, sub_layer)
-        sub_maps = self.rational_maps[:-1]
-
-        # Build a subtree FFTree manually (avoid re-running new's assertions)
-        st = object.__new__(FFTree)
-        st.f = sub_tree
-        st.rational_maps = sub_maps
-        st._from_tree()
-        return st
-
-    # ───────────────────────────────────────────────────────────────────
-    # §6.2  EXTEND  (mirrors extend_impl)
-    # ───────────────────────────────────────────────────────────────────
-
-    def _extend_impl(self, evals, moiety):
-        """
-        Extend evaluations from one moiety to the other.
-        Mirrors ``extend_impl`` in fftree.rs.
-
-        Given ``evals`` of length m — evaluations of a polynomial (deg < m) on
-        moiety ``moiety`` — compute its evaluations on the *other* moiety.
-
-        Algorithm (Lemma 3.2 of ECFFT I):
-
-        1. **Decompose**: Apply M⁻¹ matrices to split into two half-vectors.
-        2. **Recurse**: Extend each half on the subtree.
-        3. **Recombine**: Apply M matrices to merge into the other moiety.
-        """
-        m = len(evals)
-        if m == 1:
-            return list(evals)
-
-        # Matrix layer index: matches Rust's (num_layers - 2 - m.ilog2())
-        log_n_leaves = (self.f.n).bit_length() - 1     # log2(n)
-        log_m = m.bit_length() - 1                     # log2(m)
-        layer = log_n_leaves - 1 - log_m
-
-        half = m // 2
-
-        # Decompose: select the right matrices
-        # Rust: decompose_matrices.get_layer(layer), skip(1 if S0 else 0), step_by(2)
-        # That selects every other matrix from the layer.
-        d_layer = self.decompose[layer]
-        if moiety == 'S0':
-            d_mats = d_layer[1::2]    # skip 1, step 2
-        else:
-            d_mats = d_layer[0::2]    # skip 0, step 2
-
-        evals0 = [0] * half
-        evals1 = [0] * half
-        for i in range(half):
-            m_inv = d_mats[i]
-            evals0[i], evals1[i] = m_inv * (evals[i], evals[i + half])
-
-        # Recurse
-        evals0p = self._extend_impl(evals0, moiety)
-        evals1p = self._extend_impl(evals1, moiety)
-
-        # Recombine: select the right matrices (opposite skip)
-        r_layer = self.recombine[layer]
-        if moiety == 'S0':
-            r_mats = r_layer[0::2]    # skip 0, step 2
-        else:
-            r_mats = r_layer[1::2]    # skip 1, step 2
-
-        res = [0] * m
-        for i in range(half):
-            m_r = r_mats[i]
-            res[i], res[i + half] = m_r * (evals0p[i], evals1p[i])
-        return res
-
-    def extend(self, evals, moiety):
-        """Extend evals (size m) from one moiety to the other. Public API."""
-        tree = self._subtree_with_size(len(evals) * 2)
-        return tree._extend_impl(evals, moiety)
-
-    # ───────────────────────────────────────────────────────────────────
-    # §6.3  MEXTEND  (monic polynomial extension)
-    # ───────────────────────────────────────────────────────────────────
-
-    def _mextend_impl(self, evals, moiety):
-        e = self._extend_impl(evals, moiety)
-        z = self.z0_s1 if moiety == 'S1' else self.z1_s0
-        return [fadd(a, b) for a, b in zip(e, z)]
-
-    # ───────────────────────────────────────────────────────────────────
-    # §6.4  ENTER  (coefficients → evaluations)
-    # ───────────────────────────────────────────────────────────────────
-
-    def _enter_impl(self, coeffs):
-        """
-        ENTER: coefficient representation → evaluation representation.
-
-        Mirrors ``enter_impl`` in fftree.rs.
-
-        Given polynomial  f(x) = Σ cᵢ xⁱ  with  deg f < n:
-
-        1. Split:  f = u(x) + x^{n/2} · v(x)
-        2. Recursively evaluate u, v on the subtree domain (= ψ-images of S₀)
-        3. Extend those evaluations from S₀ to S₁
-        4. Recombine:  f(sⱼ) = u(sⱼ) + sⱼ^{n/2} · v(sⱼ)
-
-        The output is in leaf order:
-            [f(leaf[0]), f(leaf[1]), f(leaf[2]), …, f(leaf[n-1])]
-        where even-indexed leaves are S₀ and odd-indexed are S₁.
-        """
-        n = len(coeffs)
-        if n == 1:
-            return list(coeffs)
-
-        half = n // 2
-        st = self.subtree
-
-        # u, v on the subtree (= S₀ after ψ)
-        u0 = st.enter(coeffs[:half])
-        v0 = st.enter(coeffs[half:])
-
-        # Extend from S₀ to S₁
-        u1 = self._extend_impl(u0, 'S1')
-        v1 = self._extend_impl(v0, 'S1')
-
-        # Recombine — interleave S₀ and S₁ evaluations
-        res = []
-        for i in range(half):
-            res.append(fadd(u0[i], fmul(v0[i], self.xnn_s[2 * i])))
-            res.append(fadd(u1[i], fmul(v1[i], self.xnn_s[2 * i + 1])))
-        return res
-
-    def enter(self, coeffs):
-        """
-        ENTER: coefficients → evaluations on the domain.
-
-        ``coeffs`` is [c₀, c₁, …, c_{n-1}].
-        Returns [f(s₀), f(s₁), …, f(s_{n-1})] in leaf order.
-        """
-        tree = self._subtree_with_size(len(coeffs))
-        return tree._enter_impl(coeffs)
-
-    # ───────────────────────────────────────────────────────────────────
-    # §6.5  REDC and MOD  (modular reduction in eval-space)
-    # ───────────────────────────────────────────────────────────────────
-
-    def _redc_impl(self, evals, a, moiety):
-        """
-        REDC: compute ⟨P · Z^{-1} mod a ≀ S⟩.
-        Mirrors ``redc_impl`` in fftree.rs.
-        """
-        e0 = evals[0::2]
-        e1 = evals[1::2]
-        a0 = [a[i] for i in range(0, len(a), 2)]
-        a1 = [a[i] for i in range(1, len(a), 2)]
-        a0_inv = batch_inv(list(a0))
-
-        # ⟨π/a ≀ S₀⟩
-        t0 = [fmul(e, ai) for e, ai in zip(e0, a0_inv)]
-        opp = 'S0' if moiety == 'S1' else 'S1'
-        g1 = self._extend_impl(t0, opp)
-
-        z_inv = self.z0_inv_s1 if moiety == 'S0' else self.z1_inv_s0
-
-        # ⟨(π − a·g) / Z ≀ S'⟩
-        h1 = [fmul(fsub(e, fmul(a_v, g)), zi)
-              for e, g, a_v, zi in zip(e1, g1, a1, z_inv)]
-        h0 = self._extend_impl(h1, moiety)
-
-        res = []
-        for a, b in zip(h0, h1):
-            res.extend([a, b])
-        return res
-
-    def _modular_reduce_impl(self, evals, a, c):
-        """MOD: evals mod a, using precomputed c = ⟨Z₀² mod a ≀ S⟩."""
-        h = self._redc_impl(evals, a, 'S0')
-        hc = [fmul(hi, ci) for hi, ci in zip(h, c)]
-        return self._redc_impl(hc, a, 'S0')
-
-    # ───────────────────────────────────────────────────────────────────
-    # §6.6  EXIT  (evaluations → coefficients)
-    # ───────────────────────────────────────────────────────────────────
-
-    def _exit_impl(self, evals):
-        """
-        EXIT: evaluation representation → coefficient representation.
-
-        Mirrors ``exit_impl`` in fftree.rs.
-
-        Given evaluations [f(s₀), f(s₁), …, f(s_{n-1})] in leaf order,
-        recover the unique polynomial  f  of degree < n  and return its
-        coefficients [c₀, c₁, …, c_{n-1}].
-
-        Algorithm:
-        1. Modular-reduce to get  ⟨f mod x^{n/2} ≀ S₀⟩  (the low-half polynomial)
-        2. Recursively interpolate the low half → coefficients a
-        3. Compute  v₀[i] = (evals[2i] − u₀[i]) / s₀[i]^{n/2}
-        4. Recursively interpolate the high half → coefficients b
-        5. Return  a ∥ b
-        """
-        n = len(evals)
-        if n == 1:
-            return list(evals)
-
-        # u0 = ⟨f mod X^{n/2} ≀ S₀⟩   via modular reduction
-        u0 = self._modular_reduce_impl(evals, self.xnn_s, self.z0z0_rem_xnn_s)[0::2]
-
-        st = self.subtree
-        a = st._exit_impl(u0)
-
-        # v0[i] = (evals[2i] - u0[i]) / xnn_s[2i]
-        e0 = evals[0::2]
-        xnn0_inv = self.xnn_s_inv[0::2]
-        v0 = [fmul(fsub(e, u), xi) for e, u, xi in zip(e0, u0, xnn0_inv)]
-
-        b = st._exit_impl(v0)
-
-        return a + b
-
-    def exit(self, evals):
-        """
-        EXIT: evaluations → coefficients.
-
-        ``evals`` is [f(s₀), f(s₁), …] in leaf order.
-        Returns [c₀, c₁, …, c_{n-1}].
-        """
-        tree = self._subtree_with_size(len(evals))
-        return tree._exit_impl(evals)
-
-    # ───────────────────────────────────────────────────────────────────
-    # §6.7  DEGREE
-    # ───────────────────────────────────────────────────────────────────
-
-    def _degree_impl(self, evals):
-        n = len(evals)
-        if n == 1: return 0
-        st = self.subtree
-        e0 = evals[0::2]
-        e1 = evals[1::2]
-        g1 = self._extend_impl(e0, 'S1')
-        if g1 == e1:
-            return st._degree_impl(e0)
-        t1 = [fmul(fsub(e, g), zi)
-              for e, g, zi in zip(e1, g1, self.z0_inv_s1)]
-        t0 = self._extend_impl(t1, 'S0')
-        return n // 2 + st._degree_impl(t0)
-
-    def degree(self, evals):
-        tree = self._subtree_with_size(len(evals))
-        return tree._degree_impl(evals)
-
-    # ───────────────────────────────────────────────────────────────────
-    # §6.8  VANISH
-    # ───────────────────────────────────────────────────────────────────
-
-    def _vanish_impl(self, vanish_domain):
-        n = len(vanish_domain)
-        if n == 1:
-            l = self.f.leaves()
-            assert len(l) == 2
-            alpha = vanish_domain[0]
-            return [fsub(alpha, l[0]), fsub(alpha, l[1])]
-        st = self.subtree
-        qp  = st._vanish_impl(vanish_domain[:n // 2])
-        qpp = st._vanish_impl(vanish_domain[n // 2:])
-        q_s0 = [fmul(a, b) for a, b in zip(qp, qpp)]
-        q_s1 = self._mextend_impl(q_s0, 'S1')
-        res = []
-        for a, b in zip(q_s0, q_s1):
-            res.extend([a, b])
-        return res
-
-    # ───────────────────────────────────────────────────────────────────
-    # §6.9  Navigation
-    # ───────────────────────────────────────────────────────────────────
-
-    def _subtree_with_size(self, n):
-        """Return the (sub)tree whose leaf count equals n."""
-        if n == self.f.n:
-            return self
-        if n < self.f.n:
-            assert self.subtree is not None
-            return self.subtree._subtree_with_size(n)
-        raise ValueError("FFTree too small")
-
-    def eval_domain(self):
-        """Return the evaluation domain (leaf x-coordinates) in order."""
-        return list(self.f.leaves())
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# §7  Building an FFTree from curve parameters
-# ═══════════════════════════════════════════════════════════════════════════
-
-def build_fftree(params, log_n):
-    """
-    Build an FFTree of size 2^{log_n} from curve parameters.
-
-    ``params`` must have keys: 'a', 'bb', 'gx', 'gy', 'k'.
-
-    Returns (fftree, domain) where domain = list of evaluation x-coords.
-    """
-    assert log_n <= params['k']
-    n = 1 << log_n
-
-    curve = GoodCurve(params['a'], params['bb'])
-    gen   = Point(params['gx'], params['gy'], curve)
-
-    # Scale generator to order n
-    scaled_gen = gen.scalar_mul(1 << (params['k'] - log_n))
-
-    # Build isogeny chain → rational maps
-    psis, curves, hs = build_isogeny_chain(scaled_gen, log_n)
-
-    # Build evaluation domain:  x(O + i·G) for i = 0, …, n-1
-    # Use 2*gen as coset offset
-    coset = gen.double()
-    leaves = []
-    acc = Point.infinity()
-    for _ in range(n):
-        leaves.append((coset + acc).x)
-        acc = acc + scaled_gen
-
-    tree = FFTree(leaves, psis)
-    return tree, leaves
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# §8  Convenience:  split_domain_with_psi  (for demos)
-# ═══════════════════════════════════════════════════════════════════════════
-
-def build_evaluation_domain(generator, coset_offset, n):
-    assert n > 0 and (n & (n - 1)) == 0
-    domain, acc = [], Point.infinity()
-    for _ in range(n):
-        domain.append((coset_offset + acc).x)
-        acc = acc + generator
-    return domain
-
-
-def split_domain_with_psi(domain, psi):
-    """Split domain into S₀ (first half) and S₁ (second half) via ψ."""
-    half = len(domain) // 2
-    s0, s1 = domain[:half], domain[half:]
-    images = []
-    for i in range(half):
-        img0, img1 = psi(s0[i]), psi(s1[i])
-        assert img0 == img1, f"ψ pairing broken at {i}: {img0} ≠ {img1}"
-        images.append(img0)
-    return s0, s1, images
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# §9  Demo / verification
-# ═══════════════════════════════════════════════════════════════════════════
-
-def demo(params, size=8):
-    """
-    Full ECFFT demo: build tree, ENTER, EXIT, round-trip.
-    """
-    log_n = size.bit_length() - 1
-    assert 1 << log_n == size
-    print(f"{'='*72}")
-    print(f"ECFFT Demo — 2^{params['k']} curve, domain size {size}")
-    print(f"{'='*72}")
-
-    tree, leaves = build_fftree(params, log_n)
-    domain = tree.eval_domain()
-    print(f"  Domain: {domain[:4]}{'…' if size > 4 else ''}")
-
-    # --- ENTER ---
-    coeffs = [(i + 1) % q for i in range(size)]
-    evals = tree.enter(coeffs)
-    naive  = [poly_eval(coeffs, x) for x in domain]
-    enter_ok = evals == naive
-    print(f"  ENTER {'✓' if enter_ok else '✗'}  (matches naive eval: {enter_ok})")
-    if not enter_ok:
-        for i in range(size):
-            if evals[i] != naive[i]:
-                print(f"    [{i}] ecfft={evals[i]}  naive={naive[i]}")
-
-    # --- EXIT ---
-    recovered = tree.exit(evals)
-    exit_ok = recovered == coeffs
-    print(f"  EXIT  {'✓' if exit_ok else '✗'}  (round-trip: {exit_ok})")
-    if not exit_ok:
-        for i in range(size):
-            if recovered[i] != coeffs[i]:
-                print(f"    [{i}] got={recovered[i]}  want={coeffs[i]}")
-
-    # --- DEGREE ---
-    deg = tree.degree(evals)
-    print(f"  DEGREE ✓  deg={deg}  (expected {size - 1})" if deg == size - 1
-          else f"  DEGREE ✗  deg={deg}  (expected {size - 1})")
-
-    print(f"{'='*72}")
-    return enter_ok and exit_ok
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# §10  Naive helpers (for cross-checking)
-# ═══════════════════════════════════════════════════════════════════════════
-
-def lagrange_interpolate(xs, ys):
-    """O(n²) Lagrange interpolation → coefficient list."""
-    n = len(xs)
-    coeffs = [0] * n
-    for j in range(n):
-        basis = [1]
-        denom = 1
-        for k in range(n):
-            if k == j: continue
-            denom = fmul(denom, fsub(xs[j], xs[k]))
-            new = [0] * (len(basis) + 1)
-            for m in range(len(basis)):
-                new[m]     = fadd(new[m], fmul(basis[m], fneg(xs[k])))
-                new[m + 1] = fadd(new[m + 1], basis[m])
-            basis = new
-        scale = fdiv(ys[j], denom)
-        for m in range(len(basis)):
-            coeffs[m] = fadd(coeffs[m], fmul(basis[m], scale))
-    return coeffs
-
-
-def verify_two_to_one(psi, domain_xs):
-    images = {}
-    for x in domain_xs:
-        img = psi(x)
-        images.setdefault(img, []).append(x)
-    for img, pre in sorted(images.items()):
-        assert len(pre) == 2, f"Expected 2 preimages for {img}, got {len(pre)}"
-    return [img for img in sorted(images.keys())]
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# §11  Global ECFFT decomposition (Part I style)
+# §4  FRI domain construction
 # ═══════════════════════════════════════════════════════════════════════════
 #
-# This section provides the ECFFT Part I global decomposition:
+# The FRI protocol operates on a sequence of evaluation domains:
 #
-#     f(x) = u(ψ(x)) + x^{n/2} · v(ψ(x))
+#   L₀  →  L₁  →  ⋯  →  Lₖ
+#       ψ₀     ψ₁         ψ_{k-1}
 #
-# where  u  has the low-half coefficients (degree < n/2),  v  the high-half,
-# and  ψ  is the 2-to-1 rational map from the good isogeny.
-#
-# IMPORTANT: This decomposition is GLOBAL — it requires the full FFTree
-# modular reduction machinery (MOD = REDC∘REDC) and is O(n log n).
-# It is NOT the same as the ECFFT Part II FRI hash (see §12 below).
-#
-# The result lives on the SUBTREE domain (even-indexed leaves), which is
-# NOT the same as the ψ-image domain. This is fine for ECFFT ENTER/EXIT
-# but is NOT suitable as a verifier-checkable FRI round relation.
-#
-# For FRI-style protocols, use the functions in §12 instead.
-#
-# Functions:
-#   ecfft_decompose_step(evals, tree) → (u_evals, v_evals)
-#   ecfft_fold_step(evals, tree, α)  → folded_evals
-#   ecfft_fold(evals, tree, [α₁, α₂, …]) → fully-folded evals
-# ═══════════════════════════════════════════════════════════════════════════
-
-
-def ecfft_decompose_step(evals, tree):
-    """
-    Global ECFFT Part I decomposition: f(x) = u(ψ(x)) + x^{n/2} · v(ψ(x)).
-
-    This uses the FFTree's modular reduction machinery (O(n log n), global).
-    Result lives on the SUBTREE domain (even-indexed leaves), NOT on ψ-images.
-
-    For FRI protocols, prefer ecfri_fold_step() from §12, which is pointwise
-    and produces output on the correct ψ-image domain.
-
-    Parameters
-    ----------
-    evals : list of int
-        [f(s₀), f(s₁), …, f(s_{n-1})] in leaf order (size n).
-    tree : FFTree
-        The FFTree whose domain matches the evaluations.
-
-    Returns
-    -------
-    u_evals, v_evals : each list of int, size n/2
-        Evaluations on the subtree domain.
-    """
-    n = len(evals)
-    t = tree._subtree_with_size(n)
-
-    # Step 1: ⟨f mod x^{n/2} ≀ S₀⟩  via modular reduction
-    u_evals = t._modular_reduce_impl(evals, t.xnn_s, t.z0z0_rem_xnn_s)[0::2]
-
-    # Step 2: v₀[i] = (f(S₀[i]) − u(S₀[i])) / S₀[i]^{n/2}
-    e0 = evals[0::2]
-    xnn0_inv = t.xnn_s_inv[0::2]
-    v_evals = [fmul(fsub(e, u), xi) for e, u, xi in zip(e0, u_evals, xnn0_inv)]
-
-    return u_evals, v_evals
-
-
-def ecfft_fold_step(evals, tree, alpha):
-    """
-    Global fold: f_folded = u + α·v on the subtree domain.
-
-    WARNING: This is the Part I global decomposition, NOT the ECFFT2 FRI hash.
-    The fold is O(n log n) and the result lives on the subtree domain (even-
-    indexed leaves), which differs from the ψ-image domain. This means:
-      - The fold matrix is DENSE (every output depends on all inputs).
-      - A verifier CANNOT check a single query in O(1).
-
-    For FRI protocols, use ecfri_fold_step() from §12 instead.
-    """
-    u_evals, v_evals = ecfft_decompose_step(evals, tree)
-    return [fadd(u, fmul(alpha, v)) for u, v in zip(u_evals, v_evals)]
-
-
-def ecfft_fold(evals, tree, alphas):
-    """
-    Multi-round global fold. See ecfft_fold_step() for caveats.
-
-    For FRI protocols, use ecfri_fold() from §12 instead.
-    """
-    current = list(evals)
-    t = tree._subtree_with_size(len(current))
-    for alpha in alphas:
-        current = ecfft_fold_step(current, t, alpha)
-        if t.subtree is not None:
-            t = t.subtree
-    return current
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# §12  ECFFT Part II FRI hash — the correct pointwise fold
-# ═══════════════════════════════════════════════════════════════════════════
-#
-# This section implements the FRI algebraic hash H_z from ECFFT Part II
-# (BSCKL22, Appendix B.2). Unlike the global decomposition in §11, this
-# hash is:
-#
-#   1. POINTWISE: each output depends on exactly 2 inputs (a ψ-preimage pair).
-#   2. DEGREE-AWARE: it depends on the current degree bound d, not just |L_i|.
-#   3. Lives on the ψ-IMAGE DOMAIN: L_{i+1} = ψ_i(L_i), not the subtree.
-#
-# ── Mathematical basis ──
-#
-# The paper (ECFFT Part I, Lemma 3.2) shows that for a degree-2 rational
-# map ψ(x) = u(x)/v(x), any polynomial P of degree < d decomposes as:
-#
-#   P(x) = (P_0(ψ(x)) + x · P_1(ψ(x))) · v(x)^{d/2 - 1}
-#
-# with deg(P_0), deg(P_1) < d/2. For our good isogeny ψ(x) = (x-b)²/x,
-# the denominator is v(x) = x, so the normalization factor is x^{d/2 - 1}.
-#
-# For a pair (s_0, s_1) with ψ(s_0) = ψ(s_1) = t, setting e = d/2 - 1:
-#
-#   P(s_0) / s_0^e = P_0(t) + s_0 · P_1(t)
-#   P(s_1) / s_1^e = P_0(t) + s_1 · P_1(t)
-#
-# This is a 2×2 system. The FRI hash evaluates P_0 + z·P_1 at t:
-#
-#   H_z[P](t) = a + slope · (z - s_0)
-#
-# where:
-#   a     = P(s_0) / s_0^e
-#   b     = P(s_1) / s_1^e
-#   slope = (b - a) / (s_1 - s_0)
-#
-# ── Domain structure ──
-#
-# The domains L_0, L_1, ..., L_k are connected by ψ:
-#   L_{i+1} = {ψ_i(x) : x ∈ L_i}
-#
-# At each layer, pairing is FIRST-HALF / SECOND-HALF:
-#   ψ(L_i[j]) = ψ(L_i[j + m/2]) = L_{i+1}[j]    for j < m/2
-#
-# where m = |L_i|. This is verified during tree construction (the tree
-# stores L_i as get_layer(i), and L_{i+1}[j] = rational_maps[i](L_i[j])).
-#
-# ── Key difference from §11 ──
-#
-# The §11 global decomposition uses basis {1, x, x², ..., x^{n/2-1}}
-# and produces output on the subtree domain (even-indexed leaves).
-#
-# The §12 FRI hash uses basis {v(x)^e, x·v(x)^e} (degree-aware) and
-# produces output on the ψ-image domain. The two give DIFFERENT polynomials
-# for the same input, but both are valid degree-halving operations.
-#
-# Only §12 is suitable for FRI verification (pointwise checking).
+# Each ψᵢ is 2-to-1 on Lᵢ, halving the domain at each step.
+# The pairing invariant:  ψᵢ(Lᵢ[j]) = ψᵢ(Lᵢ[j + m/2]) = Lᵢ₊₁[j].
 # ═══════════════════════════════════════════════════════════════════════════
 
 
 def build_fri_domains(params, log_n):
     """
-    Build the FRI layer domains L_0, ..., L_k from curve parameters.
-
-    Returns a list of layers: layers[i] is a list of field elements (size 2^{log_n - i}).
-
-    The pairing invariant holds: ψ_i(L_i[j]) = ψ_i(L_i[j + m/2]) = L_{i+1}[j].
-
-    Also returns the list of rational maps (isogenies).
+    Build the FRI layer domains  L₀, …, Lₖ  from curve parameters.
 
     Parameters
     ----------
     params : dict
         Curve parameters with keys 'a', 'bb', 'gx', 'gy', 'k'.
     log_n : int
-        Log2 of the initial domain size.
+        Log₂ of the initial domain size.
 
     Returns
     -------
     layers : list of list of int
         layers[i] has size 2^{log_n - i}.
     rational_maps : list of RationalMap
-        rational_maps[i] maps L_i → L_{i+1}.
+        rational_maps[i] maps Lᵢ → Lᵢ₊₁.
     """
     assert log_n <= params['k']
     n = 1 << log_n
@@ -1163,7 +259,7 @@ def build_fri_domains(params, log_n):
     gen = Point(params['gx'], params['gy'], curve)
     scaled_gen = gen.scalar_mul(1 << (params['k'] - log_n))
 
-    # Build isogeny chain
+    # Build isogeny chain → rational maps
     psis, curves, hs = build_isogeny_chain(scaled_gen, log_n)
 
     # Initial domain: x-coordinates of coset {2G + i·scaled_gen}
@@ -1192,37 +288,55 @@ def build_fri_domains(params, log_n):
     return layers, psis
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# §5  ECFFT Part II pointwise FRI fold
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# The FRI algebraic hash  H_z  from ECFFT Part II (BSCKL22, Appendix B.2).
+#
+# For a degree-2 rational map  ψ(x) = u(x)/v(x)  with denominator v(x) = x,
+# any polynomial P of degree < d decomposes as:
+#
+#   P(x) = (P₀(ψ(x)) + x · P₁(ψ(x))) · v(x)^{d/2 − 1}
+#
+# with deg(P₀), deg(P₁) < d/2.  For a pair (s₀, s₁) with ψ(s₀) = ψ(s₁),
+# setting e = d/2 − 1:
+#
+#   P(s₀) / s₀ᵉ = P₀(t) + s₀ · P₁(t)
+#   P(s₁) / s₁ᵉ = P₀(t) + s₁ · P₁(t)
+#
+# Solving this 2×2 system and evaluating P₀ + z·P₁ at t gives:
+#
+#   H_z[P](t)  =  a + slope · (z − s₀)
+#
+# where  a = P(s₀)/s₀ᵉ,  b = P(s₁)/s₁ᵉ,  slope = (b − a)/(s₁ − s₀).
+#
+# This is POINTWISE: each output depends on exactly 2 inputs.  This is what
+# makes FRI verification O(1) per query.
+# ═══════════════════════════════════════════════════════════════════════════
+
+
 def ecfri_fold_step(word, layers, round_idx, degree_bound, z):
     """
-    ECFFT Part II FRI hash: the correct pointwise fold for FRI protocols.
-
-    For each pair (s_0, s_1) = (L_i[j], L_i[j + m/2]) with degree bound d:
-
-        e = d/2 - 1
-        a = word[j] / s_0^e              (normalize by v(s_0)^e, v(x) = x)
-        b = word[j + m/2] / s_1^e
-        slope = (b - a) / (s_1 - s_0)
-        out[j] = a + slope · (z - s_0)   (= P_0(t) + z · P_1(t))
-
-    This is POINTWISE: out[j] depends only on word[j] and word[j + m/2].
+    One round of pointwise FRI folding.
 
     Parameters
     ----------
     word : list of int
-        Evaluations on layer L_i (size m = |L_i|).
+        Evaluations on layer Lᵢ (size m = |Lᵢ|).
     layers : list of list of int
-        The FRI domain layers from build_fri_domains().
+        FRI domain layers from build_fri_domains().
     round_idx : int
-        Current round index (0-based). Uses layers[round_idx] as the domain.
+        Current round (0-based).  Uses layers[round_idx].
     degree_bound : int
-        Current degree bound d_i. Must be even, ≤ m.
+        Current degree bound dᵢ.  Must be even, ≤ m.
     z : int
         Verifier challenge.
 
     Returns
     -------
     out : list of int
-        Evaluations on layer L_{i+1} (size m/2).
+        Evaluations on layer Lᵢ₊₁ (size m/2).
     """
     layer = layers[round_idx]
     m = len(layer)
@@ -1258,14 +372,14 @@ def ecfri_fold_step(word, layers, round_idx, degree_bound, z):
 
 def ecfri_fold(word, layers, degree_bound, challenges):
     """
-    Multi-round ECFFT Part II FRI fold.
+    Multi-round pointwise FRI fold.
 
     Parameters
     ----------
     word : list of int
         Evaluations on layers[0].
     layers : list of list of int
-        The FRI domain layers from build_fri_domains().
+        FRI domain layers from build_fri_domains().
     degree_bound : int
         Initial degree bound (halved each round).
     challenges : list of int
@@ -1274,7 +388,7 @@ def ecfri_fold(word, layers, degree_bound, challenges):
     Returns
     -------
     folded : list of int
-        Evaluations on layers[len(challenges)] (size n / 2^len(challenges)).
+        Evaluations on layers[len(challenges)].
     """
     current = list(word)
     d = degree_bound
@@ -1286,29 +400,26 @@ def ecfri_fold(word, layers, degree_bound, challenges):
 
 def ecfri_verify_query(layers, round_idx, degree_bound, j, f_s0, f_s1, z):
     """
-    Verifier: compute expected fold value from a single pair opening.
+    Verify a single FRI fold query in O(1).
 
-    Given f(s_0) and f(s_1) for pair index j in round round_idx, returns
-    the expected value at layers[round_idx + 1][j].
-
-    This is the O(1) per-query check that makes FRI efficient.
+    Given f(s₀) and f(s₁) for pair index j, returns the expected fold value
+    at layers[round_idx + 1][j].
 
     Parameters
     ----------
     layers : list of list of int
-    round_idx : int
-    degree_bound : int
+    round_idx, degree_bound : int
     j : int
-        Pair index (0 ≤ j < |L_i|/2).
+        Pair index (0 ≤ j < |Lᵢ|/2).
     f_s0, f_s1 : int
-        The two opened evaluations: f(L_i[j]) and f(L_i[j + m/2]).
+        The two opened evaluations.
     z : int
         Verifier challenge for this round.
 
     Returns
     -------
     expected : int
-        The expected fold value at layers[round_idx + 1][j].
+        Expected fold value at layers[round_idx + 1][j].
     """
     layer = layers[round_idx]
     m = len(layer)
@@ -1330,92 +441,71 @@ def ecfri_verify_query(layers, round_idx, degree_bound, j, f_s0, f_s1, z):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# §13  Group-valued BaseFold (eprint 2025/1325, Section 7)
+# §6  Group-valued BaseFold  (eprint 2025/1325, Section 7)
 # ═══════════════════════════════════════════════════════════════════════════
 #
-# This section implements the group-valued BaseFold protocol from
-# "Revisiting the IPA-sumcheck connection" (Eagen & Gabizon, 2025).
-#
-# ── What it replaces ──
-#
 # In IPA verification, the "decide" step computes:
-#   G(r) = Σ_{i<n} s_i · G_i
-# where G_0,...,G_{n-1} are SRS generators and s_i are derived from IPA
-# challenges. This is an O(n) MSM that dominates recursive verification.
 #
-# BaseFold replaces this with a FRI-like protocol over GROUP ELEMENTS:
-# - The prover commits Merkle trees of group-element evaluations
-# - The verifier spot-checks fold consistency at random positions
-# - Each spot-check costs O(1) scalar multiplications
+#   G(r) = Σᵢ sᵢ · Gᵢ
 #
-# ── Protocol overview ──
+# where G₀,…,G_{n-1} are SRS generators and sᵢ are IPA-challenge-derived
+# scalars.  This O(n) MSM dominates recursive verification.
 #
-# 1. SRS ENCODING (one-time precomputation):
-#    g_0[j] = Σ_{i<n} L_0[j]^i · G_i   for j = 0,...,|L_0|-1
-#    This evaluates the "group polynomial" G(x) = Σ s_i·x^i·G_i on L_0.
-#    (For BaseFold, the s_i are IPA challenge-derived scalars.)
+# Group BaseFold replaces this with a FRI-like protocol over GROUP ELEMENTS:
 #
-# 2. FRI ROUNDS (k = log_n rounds):
-#    For round i = 0,...,k-1:
-#      a. Prover commits g_i (Merkle root of group elements on L_i)
-#      b. Verifier sends challenge z_i
-#      c. Prover computes g_{i+1} by applying the ECFFT2 fold to g_i
-#         (pointwise: each pair produces one output via 4 scalar muls)
+# 1. SRS ENCODING (one-time precompute):
+#    g₀[j] = Σᵢ L₀[j]ⁱ · Gᵢ   for each evaluation point in L₀.
+#
+# 2. FRI ROUNDS (k = log n rounds):
+#    For round i:
+#      a. Prover commits gᵢ  (Merkle root of group elements on Lᵢ)
+#      b. Verifier sends challenge zᵢ
+#      c. Prover folds:  gᵢ₊₁ = ECFFT2-fold(gᵢ, zᵢ)  — pointwise over
+#         group elements, 4 scalar muls per pair
 #
 # 3. FINAL CHECK:
-#    g_k is a single group element. Verifier checks it matches the
-#    expected final folded value.
+#    gₖ is a single group element; verifier checks it matches.
 #
-# 4. QUERY PHASE:
-#    Verifier picks ~43 random query indices. For each query, traces
-#    through all k rounds, opening the Merkle commitment at each pair
-#    and checking fold consistency:
+# 4. QUERY PHASE (~43 queries for 128-bit security):
+#    For each query, verify fold consistency across all k rounds:
 #
-#      e = d_i/2 - 1
-#      a = g_i[j] * (1/s_0^e)           (scalar mul)
-#      b = g_i[j + m/2] * (1/s_1^e)     (scalar mul)
-#      slope = (b - a) * diff_inv        (scalar mul)
-#      expected = a + slope * (z - s_0)  (scalar mul)
-#      CHECK: expected == g_{i+1}[j']    (group element equality)
+#      e = dᵢ/2 − 1
+#      a = gᵢ[j] · (1/s₀ᵉ)            (scalar mul)
+#      b = gᵢ[j + m/2] · (1/s₁ᵉ)      (scalar mul)
+#      slope = (b − a) · diff_inv       (scalar mul)
+#      expected = a + slope · (z − s₀)  (scalar mul)
+#      CHECK: expected == gᵢ₊₁[j']     (group element equality)
 #
-#    Total: 4 scalar muls + Merkle path verification per round per query.
+#    Total per round per query: 4 scalar muls + Merkle path verification.
 #
-# ── Group element representation ──
-#
-# Group elements are (x, y) pairs on the Grumpkin curve (= BN254 G1 with
-# base field = BN254 Fq). Scalar multiplication and addition are the
-# standard elliptic curve operations.
-#
+# Group elements are (x, y) pairs on Grumpkin (BN254 G1 over Fq).
 # For Merkle commitments, each leaf is hash(x, y) using Poseidon2.
 # ═══════════════════════════════════════════════════════════════════════════
 
 
 def basefold_group_fold_step(g_word, layers, round_idx, degree_bound, z):
     """
-    BaseFold prover: fold a group-element oracle using the ECFFT2 hash.
+    BaseFold prover: fold a group-element vector using the ECFFT2 hash.
 
-    Same formula as ecfri_fold_step, but operating on (x, y) curve points
-    instead of field elements. "Division" by a scalar becomes multiplication
-    by the scalar inverse; "addition" is group addition.
+    Same formula as ecfri_fold_step, but over (x, y) curve points.
+    "Division" by a scalar → multiplication by its inverse;
+    "addition" → group addition.
 
     Parameters
     ----------
-    g_word : list of (int, int)
-        Group elements (x, y) on layer L_i (size m).
-        Each element is a pair of field elements (affine coordinates).
+    g_word : list of (int, int) or None
+        Group elements on layer Lᵢ (size m).  None = point at infinity.
     layers : list of list of int
-        The FRI domain layers from build_fri_domains().
+        FRI domain layers from build_fri_domains().
     round_idx : int
-        Current round.
     degree_bound : int
-        Current degree bound.
     z : int
         Verifier challenge.
 
     Returns
     -------
-    g_out : list of (int, int)
-        Group elements on layer L_{i+1} (size m/2).
+    g_out : list of (int, int) or None
+        Group elements on layer Lᵢ₊₁ (size m/2).
     """
     layer = layers[round_idx]
     m = len(layer)
@@ -1440,16 +530,16 @@ def basefold_group_fold_step(g_word, layers, round_idx, degree_bound, z):
         s0_e_inv = s_e_invs[j]
         s1_e_inv = s_e_invs[j + half]
 
-        # a = g_word[j] * (1/s_0^e)  — scalar mul on group element
+        # a = g_word[j] · (1/s₀ᵉ)
         a = _group_scalar_mul(g_word[j], s0_e_inv)
-        # b = g_word[j + half] * (1/s_1^e)
+        # b = g_word[j + half] · (1/s₁ᵉ)
         b = _group_scalar_mul(g_word[j + half], s1_e_inv)
 
-        # slope = (b - a) * diff_inv  — group subtraction then scalar mul
+        # slope = (b − a) · diff_inv
         b_minus_a = _group_add(b, _group_neg(a))
         slope = _group_scalar_mul(b_minus_a, diff_invs[j])
 
-        # out = a + slope * (z - s_0)
+        # out = a + slope · (z − s₀)
         z_minus_s0 = fsub(z, layer[j])
         g_out[j] = _group_add(a, _group_scalar_mul(slope, z_minus_s0))
 
@@ -1460,19 +550,19 @@ def basefold_verify_query(layers, round_idx, degree_bound, j, g_s0, g_s1, z):
     """
     BaseFold verifier: check a single fold query over group elements.
 
-    Same as ecfri_verify_query but over group elements. Returns the
-    expected fold value as a group element.
+    Returns the expected fold value as a group element.  The verifier
+    compares this against the committed value at layers[round_idx + 1][j].
 
     Parameters
     ----------
     layers : list of list of int
     round_idx, degree_bound, j, z : as in ecfri_verify_query
-    g_s0, g_s1 : (int, int)
+    g_s0, g_s1 : (int, int) or None
         Opened group elements at the pair.
 
     Returns
     -------
-    expected : (int, int)
+    expected : (int, int) or None
         Expected group element at layers[round_idx + 1][j].
     """
     layer = layers[round_idx]
@@ -1496,11 +586,11 @@ def basefold_verify_query(layers, round_idx, degree_bound, j, g_s0, g_s1, z):
     return _group_add(a, _group_scalar_mul(slope, z_minus_s0))
 
 
-# ── Group element helpers (simple affine arithmetic over Fq) ──
-# These operate on tuples (x, y) or None for the point at infinity.
+# ── Group element helpers (affine arithmetic over Fq) ──
+# Points are (x, y) tuples or None for the identity.
 
 def _group_add(p, q_pt):
-    """Add two affine points on a Weierstrass curve (or None for infinity)."""
+    """Add two affine points on a short Weierstrass curve (a=0, i.e. Grumpkin)."""
     if p is None:
         return q_pt
     if q_pt is None:
@@ -1509,10 +599,7 @@ def _group_add(p, q_pt):
     qx, qy = q_pt
     if px == qx:
         if py == qy and py != 0:
-            # Point doubling — we need the curve 'a' parameter.
-            # For Grumpkin: y² = x³ + b (a=0), so λ = 3x²/(2y).
-            # For general Montgomery: caller should provide curve params.
-            # Using a=0 Weierstrass for now (Grumpkin).
+            # Point doubling:  λ = 3x²/(2y)  for y² = x³ + b  (a = 0)
             lam = fdiv(fmul(3, fmul(px, px)), fmul(2, py))
         else:
             return None  # point at infinity
@@ -1550,9 +637,10 @@ def _group_scalar_mul(p, scalar):
 
 
 if __name__ == "__main__":
-    print("This module provides the FFTree class and ECFFT algorithms.")
-    print("Import a parameter file and call demo(params) to test.")
+    print("ECFFT for Group BaseFold — core algorithms")
     print()
-    print("  from ecfft_params_2_18 import params")
-    print("  from ecfft_algorithms import demo")
-    print("  demo(params, size=8)")
+    print("  from ecfft_algorithms import build_fri_domains, ecfri_fold_step")
+    print("  from ecfft_algorithms import basefold_group_fold_step, basefold_verify_query")
+    print("  from ecfft_params_2_20 import params")
+    print()
+    print("For the general FFTree (ENTER/EXIT/EXTEND/DEGREE), see ecfft_fftree.py")

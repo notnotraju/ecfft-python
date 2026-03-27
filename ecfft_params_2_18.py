@@ -47,9 +47,11 @@ from ecfft_algorithms import (
     q, fadd, fsub, fmul, fdiv, fneg, finv, fsqrt, fpow,
     GoodCurve, Point, RationalMap,
     good_isogeny, apply_isogeny, build_isogeny_chain,
+    poly_eval,
+)
+from ecfft_fftree import (
     build_evaluation_domain, split_domain_with_psi,
-    build_fftree, FFTree, lagrange_interpolate,
-    poly_eval, demo
+    build_fftree, FFTree, lagrange_interpolate, demo,
 )
 
 # ---------------------------------------------------------------------------
