@@ -12,9 +12,9 @@ Rust reference: [andrewmilson/ecfft](https://github.com/andrewmilson/ecfft).
 
 ## The problem
 
-In IPA verification, the "decide" step computes G(r) = sum_i s_i * G_i — an O(n) MSM that dominates recursive verification cost. Group BaseFold replaces this with a FRI-like protocol over **group elements**, reducing the verifier to O(lambda * log^2 n) scalar multiplications via Merkle-committed fold oracles and random spot-checks.
+In IPA verification, the "decide" step computes $G(r) = \sum_i s_i \cdot G_i$ — an $O(n)$ MSM that dominates recursive verification cost. Group BaseFold replaces this with a FRI-like protocol over **group elements**, reducing the verifier to $O(\lambda \cdot \log^2 n)$ scalar multiplications via Merkle-committed fold oracles and random spot-checks.
 
-The ECFFT is what makes this work over BN-254: the base field has no roots of unity of large 2-power order, so the standard FFT doesn't apply. The ECFFT replaces roots of unity with x-coordinates of elliptic curve points, and the squaring map x -> x^2 with a rational map psi(x) = (x - b)^2/x induced by a good isogeny.
+The ECFFT is what makes this work over BN-254: the base field has no roots of unity of large 2-power order, so the standard FFT doesn't apply. The ECFFT replaces roots of unity with x-coordinates of elliptic curve points, and the squaring map $x \mapsto x^2$ with a rational map $\psi(x) = (x - b)^2/x$ induced by a good isogeny.
 
 ## Files
 
@@ -22,9 +22,9 @@ The ECFFT is what makes this work over BN-254: the base field has no roots of un
 |------|---------|
 | `ecfft_algorithms.py` | **Core**: field arithmetic, curves, isogenies, FRI domains, ECFFT2 pointwise fold, group-valued BaseFold |
 | `ecfft_fftree.py` | **General ECFFT**: FFTree with ENTER/EXIT/EXTEND/DEGREE, global Part I decomposition |
-| `ecfft_params_2_18.py` | Curve parameters with a cyclic 2^18 subgroup |
-| `ecfft_params_2_19.py` | Curve parameters with a cyclic 2^19 subgroup |
-| `ecfft_params_2_20.py` | Curve parameters with a cyclic 2^20 subgroup |
+| `ecfft_params_2_18.py` | Curve parameters with a cyclic $2^{18}$ subgroup |
+| `ecfft_params_2_19.py` | Curve parameters with a cyclic $2^{19}$ subgroup |
+| `ecfft_params_2_20.py` | Curve parameters with a cyclic $2^{20}$ subgroup |
 | `demo.ipynb` | Interactive walkthrough |
 
 ## Quick start: Group BaseFold
@@ -88,19 +88,19 @@ assert deg == 31
 
 ## How the ECFFT fold works
 
-In the classic FFT, the squaring map x -> x^2 is 2-to-1 on roots of unity, and FRI folding exploits this: f(omega^i) and f(-omega^i) share the same even/odd decomposition values, so folding is a pointwise 2x2 operation.
+In the classic FFT, the squaring map $x \mapsto x^2$ is 2-to-1 on roots of unity, and FRI folding exploits this: $f(\omega^i)$ and $f(-\omega^i)$ share the same even/odd decomposition values, so folding is a pointwise $2 \times 2$ operation.
 
-The ECFFT replaces the squaring map with psi(x) = (x - b)^2/x, which is 2-to-1 on evaluation domains built from curve points. For a pair (s_0, s_1) with psi(s_0) = psi(s_1) and degree bound d:
+The ECFFT replaces the squaring map with $\psi(x) = (x - b)^2/x$, which is 2-to-1 on evaluation domains built from curve points. For a pair $(s_0, s_1)$ with $\psi(s_0) = \psi(s_1)$ and degree bound $d$:
 
-```
-e = d/2 - 1
-a = P(s_0) / s_0^e          (normalize by denominator power)
-b = P(s_1) / s_1^e
-slope = (b - a) / (s_1 - s_0)
-H_z[P](t) = a + slope * (z - s_0)    (= P_0(t) + z * P_1(t))
-```
+$$e = d/2 - 1$$
 
-This is **pointwise**: each output depends on exactly 2 inputs. This is what makes FRI verification O(1) per query — and what makes group BaseFold possible, since scalar-multiplying a group element is cheap but a dense matrix-vector product over group elements is not.
+$$a = P(s_0) / s_0^e, \quad b = P(s_1) / s_1^e$$
+
+$$\text{slope} = \frac{b - a}{s_1 - s_0}$$
+
+$$H_z[P](t) = a + \text{slope} \cdot (z - s_0) = P_0(t) + z \cdot P_1(t)$$
+
+This is **pointwise**: each output depends on exactly 2 inputs. This is what makes FRI verification $O(1)$ per query — and what makes group BaseFold possible, since scalar-multiplying a group element is cheap but a dense matrix-vector product over group elements is not.
 
 ## Requirements
 
