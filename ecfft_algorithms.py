@@ -262,7 +262,9 @@ def build_fri_domains(params, log_n):
     # Build isogeny chain → rational maps
     psis, curves, hs = build_isogeny_chain(scaled_gen, log_n)
 
-    # Initial domain: x-coordinates of coset {2G + i·scaled_gen}
+    # Initial domain: x-coordinates of coset {2G + i·scaled_gen}.
+    # We use 2G as the coset offset to avoid the 2-torsion point T = (0,0)
+    # landing in the domain (T is in ker(ψ), so ψ(0) is undefined).
     coset = gen.double()
     L0, acc = [], Point.infinity()
     for _ in range(n):
@@ -352,18 +354,18 @@ def ecfri_fold_step(word, layers, round_idx, degree_bound, z):
 
     out = [0] * half
     for j in range(half):
-        s0 = layer[j]
-        s1 = layer[j + half]
+        s0 = layer[j]                           # paired domain points:
+        s1 = layer[j + half]                    #   ψ(s₀) = ψ(s₁) = L_{i+1}[j]
 
-        # Normalize by v(s)^e = s^e
-        if e == 0:
+        # Normalize:  a = P(s₀)/s₀ᵉ,  b = P(s₁)/s₁ᵉ
+        if e == 0:                              # d = 2: e = 0, no normalization
             a = word[j]
             b = word[j + half]
         else:
             a = fdiv(word[j], fpow(s0, e))
             b = fdiv(word[j + half], fpow(s1, e))
 
-        # Evaluate line through (s0, a) and (s1, b) at z
+        # H_z[P](t) = a + slope · (z − s₀)   where slope = (b − a)/(s₁ − s₀)
         slope = fmul(fsub(b, a), diff_invs[j])
         out[j] = fadd(a, fmul(slope, fsub(z, s0)))
 
@@ -403,7 +405,8 @@ def ecfri_verify_query(layers, round_idx, degree_bound, j, f_s0, f_s1, z):
     Verify a single FRI fold query in O(1).
 
     Given f(s₀) and f(s₁) for pair index j, returns the expected fold value
-    at layers[round_idx + 1][j].
+    at layers[round_idx + 1][j].  This is the verifier's core check: it
+    recomputes one output of ecfri_fold_step from just 2 opened evaluations.
 
     Parameters
     ----------
@@ -412,7 +415,7 @@ def ecfri_verify_query(layers, round_idx, degree_bound, j, f_s0, f_s1, z):
     j : int
         Pair index (0 ≤ j < |Lᵢ|/2).
     f_s0, f_s1 : int
-        The two opened evaluations.
+        The two opened evaluations: f(Lᵢ[j]) and f(Lᵢ[j + m/2]).
     z : int
         Verifier challenge for this round.
 
@@ -424,20 +427,20 @@ def ecfri_verify_query(layers, round_idx, degree_bound, j, f_s0, f_s1, z):
     layer = layers[round_idx]
     m = len(layer)
     half = m // 2
-    e = degree_bound // 2 - 1
+    e = degree_bound // 2 - 1              # normalization exponent
 
-    s0 = layer[j]
+    s0 = layer[j]                           # paired domain points
     s1 = layer[j + half]
-    diff_inv = finv(fsub(s1, s0))
+    diff_inv = finv(fsub(s1, s0))           # 1 / (s₁ − s₀)
 
-    if e == 0:
+    if e == 0:                              # d = 2: no normalization needed
         a, b = f_s0, f_s1
     else:
-        a = fdiv(f_s0, fpow(s0, e))
-        b = fdiv(f_s1, fpow(s1, e))
+        a = fdiv(f_s0, fpow(s0, e))        # a = f(s₀) / s₀ᵉ
+        b = fdiv(f_s1, fpow(s1, e))        # b = f(s₁) / s₁ᵉ
 
-    slope = fmul(fsub(b, a), diff_inv)
-    return fadd(a, fmul(slope, fsub(z, s0)))
+    slope = fmul(fsub(b, a), diff_inv)      # (b − a) / (s₁ − s₀)
+    return fadd(a, fmul(slope, fsub(z, s0)))  # a + slope · (z − s₀)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -487,9 +490,13 @@ def basefold_group_fold_step(g_word, layers, round_idx, degree_bound, z):
     """
     BaseFold prover: fold a group-element vector using the ECFFT2 hash.
 
-    Same formula as ecfri_fold_step, but over (x, y) curve points.
-    "Division" by a scalar → multiplication by its inverse;
-    "addition" → group addition.
+    Identical formula to ecfri_fold_step (§5), with field operations replaced
+    by group operations:
+
+        field add      →  group add        (elliptic curve addition)
+        field mul      →  scalar mul       (EC scalar multiplication)
+        field div by c →  scalar mul by 1/c
+        field sub      →  group sub        (add the negation)
 
     Parameters
     ----------
@@ -550,8 +557,9 @@ def basefold_verify_query(layers, round_idx, degree_bound, j, g_s0, g_s1, z):
     """
     BaseFold verifier: check a single fold query over group elements.
 
-    Returns the expected fold value as a group element.  The verifier
-    compares this against the committed value at layers[round_idx + 1][j].
+    Group-element analogue of ecfri_verify_query (§5).  Given the two opened
+    group elements at a pair, recomputes the expected fold output.  The
+    verifier compares this against the committed value at layers[round_idx + 1][j].
 
     Parameters
     ----------
@@ -568,29 +576,38 @@ def basefold_verify_query(layers, round_idx, degree_bound, j, g_s0, g_s1, z):
     layer = layers[round_idx]
     m = len(layer)
     half = m // 2
-    e = degree_bound // 2 - 1
+    e = degree_bound // 2 - 1              # normalization exponent
 
-    s0 = layer[j]
+    s0 = layer[j]                           # paired domain points
     s1 = layer[j + half]
-    diff_inv = finv(fsub(s1, s0))
+    diff_inv = finv(fsub(s1, s0))           # 1 / (s₁ − s₀)  (scalar)
 
-    if e == 0:
+    if e == 0:                              # d = 2: no normalization
         a, b = g_s0, g_s1
     else:
-        a = _group_scalar_mul(g_s0, finv(fpow(s0, e)))
-        b = _group_scalar_mul(g_s1, finv(fpow(s1, e)))
+        a = _group_scalar_mul(g_s0, finv(fpow(s0, e)))  # a = G₀ · (1/s₀ᵉ)
+        b = _group_scalar_mul(g_s1, finv(fpow(s1, e)))  # b = G₁ · (1/s₁ᵉ)
 
-    b_minus_a = _group_add(b, _group_neg(a))
-    slope = _group_scalar_mul(b_minus_a, diff_inv)
-    z_minus_s0 = fsub(z, s0)
-    return _group_add(a, _group_scalar_mul(slope, z_minus_s0))
+    b_minus_a = _group_add(b, _group_neg(a))             # group subtraction
+    slope = _group_scalar_mul(b_minus_a, diff_inv)        # slope · (1/(s₁−s₀))
+    z_minus_s0 = fsub(z, s0)                              # z − s₀  (scalar)
+    return _group_add(a, _group_scalar_mul(slope, z_minus_s0))  # a + slope·(z−s₀)
 
 
 # ── Group element helpers (affine arithmetic over Fq) ──
+#
+# These operate on the TARGET GROUP of the BaseFold protocol — typically
+# Grumpkin (y² = x³ + b, a short Weierstrass curve with a = 0), which is
+# the cycle partner of BN-254.
+#
+# NOTE: The Good Curves in §2 (y² = x³ + a·x² + B·x) are the ECFFT domain
+# curves used to build evaluation domains.  The group elements being folded
+# live on a DIFFERENT curve (Grumpkin).  Don't confuse the two.
+#
 # Points are (x, y) tuples or None for the identity.
 
 def _group_add(p, q_pt):
-    """Add two affine points on a short Weierstrass curve (a=0, i.e. Grumpkin)."""
+    """Add two affine points.  Assumes a = 0 short Weierstrass (Grumpkin)."""
     if p is None:
         return q_pt
     if q_pt is None:
