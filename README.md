@@ -1,20 +1,43 @@
 # ecfft-python
 
-Pure-Python implementation of the **Elliptic Curve Fast Fourier Transform** (ECFFT) over the BN-254 base field, organized around the **group-valued BaseFold** protocol from [eprint 2025/1325](https://eprint.iacr.org/2025/1325).
+Pure-Python reference implementation of the **ECFFT** (Elliptic Curve Fast Fourier Transform) over the BN-254 base field, organized around the **group-valued BaseFold** protocol from [eprint 2025/1325](https://eprint.iacr.org/2025/1325).
 
-This is a literate, dependency-free implementation based on:
+This is a literate, dependency-free implementation of the **algebraic core** — the fold formulas and domain construction. It does not implement the full interactive protocol (Merkle commitments, Fiat-Shamir, query phase). See [What is and isn't implemented](#what-is-and-isnt-implemented) below.
 
-- [ECFFT Part I: Fast Polynomial Algorithms over all Finite Fields](https://arxiv.org/pdf/2107.08473.pdf) (Ben-Sasson, Carmon, Frankel, Kopparty)
+Based on:
+
+- [ECFFT Part I](https://arxiv.org/pdf/2107.08473.pdf) (Ben-Sasson, Carmon, Frankel, Kopparty)
 - [ECFFT Part II](https://www.math.toronto.edu/swastik/ECFFT2.pdf) (Ben-Sasson, Carmon, Kopparty, Levit)
 - [Revisiting the IPA-sumcheck connection](https://eprint.iacr.org/2025/1325) (Eagen, Gabizon)
-
-Rust reference: [andrewmilson/ecfft](https://github.com/andrewmilson/ecfft).
+- Rust reference: [andrewmilson/ecfft](https://github.com/andrewmilson/ecfft)
 
 ## The problem
 
 In IPA verification, the "decide" step computes $G(r) = \sum_i s_i \cdot G_i$ — an $O(n)$ MSM that dominates recursive verification cost. Group BaseFold replaces this with a FRI-like protocol over **group elements**, reducing the verifier to $O(\lambda \cdot \log^2 n)$ scalar multiplications via Merkle-committed fold oracles and random spot-checks.
 
 The ECFFT is what makes this work over BN-254: the base field has no roots of unity of large 2-power order, so the standard FFT doesn't apply. The ECFFT replaces roots of unity with x-coordinates of elliptic curve points, and the squaring map $x \mapsto x^2$ with a rational map $\psi(x) = (x - b)^2/x$ induced by a good isogeny.
+
+## What is and isn't implemented
+
+**Implemented** (the algebraic core):
+
+- Field arithmetic over $\mathbb{F}_q$ (BN-254 base field)
+- Elliptic curve group law, good isogeny construction, isogeny chains
+- FRI domain construction: the layer sequence $L_0 \xrightarrow{\psi_0} L_1 \xrightarrow{\psi_1} \cdots \xrightarrow{\psi_{k-1}} L_k$
+- ECFFT2 pointwise FRI fold over field elements (`ecfri_fold_step`, `ecfri_verify_query`)
+- Group-valued BaseFold fold over curve points (`basefold_group_fold_step`, `basefold_verify_query`)
+- General-purpose FFTree: ENTER, EXIT, EXTEND, DEGREE (in `ecfft_fftree.py`)
+- Precomputed curve parameters for $2^{18}$, $2^{19}$, $2^{20}$ subgroups
+
+**Not implemented** (protocol plumbing):
+
+- Merkle tree commitments (hashing group elements, building/verifying proofs)
+- Prover/verifier protocol loop (commit → challenge → fold → repeat)
+- Fiat-Shamir transform (deriving challenges from transcript)
+- SRS encoding ($g_0[j] = \sum_i L_0[j]^i \cdot G_i$)
+- Query sampling and multi-round verification orchestration
+
+The fold formulas are the mathematically interesting part; the protocol plumbing is standard and lives in the production C++ implementation.
 
 ## Files
 
