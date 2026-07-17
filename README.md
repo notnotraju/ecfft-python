@@ -10,6 +10,9 @@ Based on:
 - [ECFFT Part II](https://www.math.toronto.edu/swastik/ECFFT2.pdf) (Ben-Sasson, Carmon, Kopparty, Levit)
 - [Revisiting the IPA-sumcheck connection](https://eprint.iacr.org/2025/1325) (Eagen, Gabizon)
 - Rust reference: [andrewmilson/ecfft](https://github.com/andrewmilson/ecfft)
+## AI
+
+This code was mostly generated with Claude, with some human review and edits.
 
 ## The problem
 
